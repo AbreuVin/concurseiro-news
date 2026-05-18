@@ -1,0 +1,13 @@
+.env
+.browser_profile/
+db/
+data/raw/
+data/processed/
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+*.egg-info/
+dist/
+.pytest_cache/

@@ -1,8 +1,6 @@
 # Concurseiro News Bot
 
-Bot de Telegram com IA que responde dúvidas sobre concursos públicos abertos na Bahia, usando como fonte oficial publicações do Diário Oficial do Estado (DOE-BA).
-
-O bot faz ETL automatizado do DOE, indexa as publicações numa base vetorial, e responde perguntas em linguagem natural via RAG (Retrieval-Augmented Generation).
+Bot de Telegram com IA que responde dúvidas sobre concursos públicos na Bahia e envia notificações personalizadas quando novos editais são publicados no Diário Oficial do Estado (DOE-BA).
 
 ---
 
@@ -10,72 +8,130 @@ O bot faz ETL automatizado do DOE, indexa as publicações numa base vetorial, e
 
 | Camada | Tecnologia |
 |---|---|
-| Linguagem | Python 3.11+ |
-| Framework de agente | [Agno](https://docs.agno.com) |
-| Modelo LLM | Google Gemini 2.0 Flash |
-| Base vetorial | LanceDB |
-| Interface | Telegram Bot API (`python-telegram-bot`) |
-| ETL | `httpx` + `BeautifulSoup` |
-| Scheduler | APScheduler |
+| Linguagem | Python 3.12+ |
+| Framework RAG | LangChain 1.x (LCEL) + `langchain-classic` |
+| LLM | Llama 3.3 70B via Groq (`langchain-groq`) |
+| Embeddings | `paraphrase-multilingual-MiniLM-L12-v2` — local, sem custo de API |
+| Base vetorial | LanceDB embedded (arquivos em `./db/`) |
+| Chunking | `ParentDocumentRetriever` — filhos 200 chars (busca) / pais 1500 chars (contexto) |
+| Interface | Telegram Bot API (`python-telegram-bot` v21+) |
+| Agendamento | JobQueue nativo do `python-telegram-bot` |
+| Scraping | `httpx` + `BeautifulSoup4` |
+| Perfis de usuário | SQLite (`./db/users.db`) |
 
 ---
 
 ## Arquitetura
 
 ```
-┌─────────────────┐      ┌──────────────────┐      ┌──────────────────┐
-│   DOE Bahia     │ ───> │  ETL (scraper)   │ ───> │  LanceDB         │
-│   (site oficial)│      │  beautifulsoup   │      │  (vector store)  │
-└─────────────────┘      └──────────────────┘      └────────┬─────────┘
-                                                            │
-                                                            │ retrieval
-                                                            ▼
-┌─────────────────┐      ┌──────────────────┐      ┌──────────────────┐
-│  Usuário        │ <──> │  Telegram Bot    │ <──> │  Agno Agent      │
-│  (Telegram)     │      │  (handler)       │      │  + Gemini        │
-└─────────────────┘      └──────────────────┘      └──────────────────┘
+┌─────────────────┐     ┌──────────────────────┐     ┌─────────────────────────┐
+│   DOE-BA        │────>│  ETL Pipeline        │────>│  LanceDB                │
+│  (DOOL/apifront)│     │  httpx + BS4         │     │  chunks filhos (200c)   │
+└─────────────────┘     │  filtro concursos    │     ├─────────────────────────┤
+                        └──────────────────────┘     │  LocalFileStore         │
+                                                      │  chunks pais (1500c)    │
+                                                      └────────────┬────────────┘
+                                                                   │ ParentDocumentRetriever
+                                                                   ▼
+┌─────────────────┐     ┌──────────────────────┐     ┌─────────────────────────┐
+│  Usuário        │<───>│  Telegram Bot        │<───>│  RAG Chain              │
+│  (Telegram)     │     │  + perfil SQLite     │     │  Groq / Llama 3.3 70B   │
+└─────────────────┘     └──────────────────────┘     │  guardrail + threshold  │
+                                                      │  memória 5 turnos       │
+                                                      │  data atual no contexto │
+                                                      └─────────────────────────┘
 ```
 
-O scheduler roda o ETL 2x ao dia (07h e 19h), atualizando a base com as publicações mais recentes.
+O JobQueue dispara o ETL 2× ao dia (07h e 19h, horário da Bahia), reindexando as publicações dos últimos 30 dias e notificando usuários conforme seus interesses.
 
 ---
 
 ## Funcionalidades
 
-- [x] Raspagem automatizada de publicações do DOE-BA com filtro por palavras-chave (concurso, edital, seleção)
-- [x] Indexação vetorial com embeddings via Gemini
-- [x] Agente Agno com RAG nativo e citação de fonte (data + órgão)
-- [x] Bot Telegram com `/start` e respostas em linguagem natural
-- [x] Scheduler interno para ETL periódico
-- [ ] Expansão para SAEB, TJBA, Prefeitura de Salvador (v1.1)
-- [ ] Comando `/buscar <termo>` com filtro específico (v1.2)
-- [ ] Notificação proativa de novos editais em tópicos inscritos (v2)
+- [x] Raspagem automatizada do DOE-BA via API do DOOL (`/apifront/portal/...`)
+- [x] Filtro por palavras-chave de concurso público (edital de abertura, nomeação, homologação, REDA, PSS...)
+- [x] Chunking hierárquico: chunks pequenos para busca precisa, chunks grandes para resposta rica
+- [x] Embeddings locais — zero custo, zero rate limit
+- [x] LLM via Groq — free tier de 14.400 req/dia com hardware dedicado
+- [x] Guardrail temático — recusa perguntas fora do escopo de concursos públicos baianos
+- [x] Similarity threshold — não chama o LLM quando não há documentos relevantes
+- [x] Memória de conversa por usuário (janela deslizante de 5 turnos)
+- [x] Consciência temporal — data atual injetada no prompt para referenciar "esta semana", "recente"
+- [x] Perfil de interesses por usuário com notificação diária ou por novidade
+- [x] ETL + notificações agendados 07h/19h via JobQueue
+- [ ] Expansão para SAEB, TJBA, Prefeitura de Salvador
+- [ ] Comando `/buscar <termo>` para consulta direta ao índice
 
 ---
 
-## Uso
+## Comandos do bot
 
-### Primeira execução — indexar a base
+| Comando | Descrição |
+|---|---|
+| `/start` | Apresentação e instruções |
+| `/interesse <termo>` | Adiciona um interesse (ex: `/interesse analista`) |
+| `/remover <termo>` | Remove um interesse |
+| `/perfil` | Lista interesses, frequência e publicações já vistas |
+| `/frequencia diario` | Recebe resumo todo dia às 07h |
+| `/frequencia novidades` | Recebe aviso só quando sair algo novo |
+| `/vagas` | Busca publicações recentes pelos seus interesses |
+| _(mensagem livre)_ | Pergunta em linguagem natural ao RAG |
+
+---
+
+## Configuração
+
+### 1. Copie e preencha o `.env`
 
 ```bash
-# Roda o ETL + indexação (só precisa uma vez para bootstrap)
+cp .env.example .env
+```
+
+```env
+GROQ_API_KEY=sua_chave_groq
+TELEGRAM_TOKEN=token_do_botfather
+
+# Opcionais
+LANCEDB_PATH=./db
+TABLE_NAME=doe_ba
+DOOL_SESSION_COOKIE=valor_do_cookie_CAKEPHP
+DOOL_SESSION_COOKIE2=valor_do_cookiesession1
+```
+
+- **Groq API Key:** [console.groq.com](https://console.groq.com) — conta gratuita, sem cartão
+- **Telegram Token:** crie um bot no [@BotFather](https://t.me/BotFather)
+- **Cookies do DOOL:** opcionais; melhoram acesso a edições restritas
+
+### 2. Instale as dependências
+
+```bash
+pip install -r requirements.txt
+```
+
+### 3. Indexe a base vetorial
+
+```bash
 python -m src.etl.pipeline
 ```
 
-### Subir o bot
+Na primeira execução o modelo de embedding (~90 MB) é baixado automaticamente. As próximas execuções reutilizam o cache local.
+
+### 4. Suba o bot
 
 ```bash
 python main.py
 ```
 
-O bot ficará em modo `polling`. Abra seu Telegram, procure pelo nome do bot que você criou no BotFather, e comece a conversar.
+O bot inicia em modo `polling` e agenda o ETL automaticamente. Procure o nome do bot no Telegram e comece a conversar.
 
-### Exemplos de perguntas
+---
 
-- "Tem concurso aberto para analista de sistemas?"
-- "O que foi publicado essa semana sobre SEFAZ?"
-- "Quais os últimos editais da Secretaria de Educação?"
-- "Tem concurso com salário acima de R$ 5000?"
+## Exemplos de perguntas
+
+- "Quais órgãos publicaram editais de concurso esta semana?"
+- "Tem alguma nomeação recente na EMBASA?"
+- "Houve retificação de edital da Secretaria de Educação?"
+- "Quais concursos tiveram homologação publicada nos últimos dias?"
 
 ---
 
@@ -85,42 +141,38 @@ O bot ficará em modo `polling`. Abra seu Telegram, procure pelo nome do bot que
 concurseiro-news/
 ├── .env.example
 ├── requirements.txt
-├── README.md
-├── main.py                  # entrypoint (sobe bot + scheduler)
-├── assets/
-│   └── demo.gif
-├── data/
-│   ├── raw/                 # HTML/JSON bruto do scraping
-│   └── processed/           # texto limpo e chunked
-├── db/                      # LanceDB (ignorado pelo git)
+├── main.py                   # entrypoint — carrega chain e inicia o bot
 └── src/
-    ├── config.py
+    ├── config.py             # pydantic-settings, lê o .env
     ├── etl/
-    │   ├── doe_ba.py
-    │   └── pipeline.py
-    ├── knowledge/
-    │   └── base.py
-    ├── agent/
-    │   └── concurseiro.py
+    │   ├── doe_ba.py         # scraper DOE-BA (httpx + BS4)
+    │   └── pipeline.py       # ETL → ParentDocumentRetriever → LanceDB
+    ├── rag/
+    │   ├── retriever.py      # ParentDocumentRetriever (child/parent chunks)
+    │   └── chain.py          # RAG chain: guardrail, threshold, memória, data
     ├── bot/
-    │   └── telegram_bot.py
-    └── scheduler.py
+    │   ├── telegram_bot.py   # handlers e agendamento JobQueue
+    │   └── notifier.py       # ETL + push de notificações por interesse
+    └── db/
+        └── users.py          # perfis de usuário (SQLite)
 ```
+
+---
+
 ## Roadmap
 
-### v1.1 (próximas 2 semanas)
+### v1.1
 - Scraping do SAEB (Superintendência de Administração do Estado da Bahia)
-- Scraping do TJBA (Tribunal de Justiça)
-- Scraping da Prefeitura de Salvador
+- Scraping do TJBA (Tribunal de Justiça da Bahia)
+- Scraping da Prefeitura de Salvador (SEMGE)
 
 ### v1.2
-- Comando `/buscar <termo>` para busca específica
-- Comando `/ultimos` para ver publicações da semana
-- Histórico de conversa (memória do agente por usuário)
+- Comando `/buscar <termo>` para busca direta no índice
+- Comando `/ultimos` para listar publicações recentes por categoria
 
 ### v2
-- Notificação push quando novos editais forem publicados em áreas de interesse
 - Interface admin (Streamlit) para monitorar métricas de uso
+- Suporte a múltiplos estados brasileiros
 
 ---
 
