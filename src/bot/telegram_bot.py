@@ -1,8 +1,6 @@
 from datetime import time
 from zoneinfo import ZoneInfo
 
-MAX_HISTORY_TURNS = 5
-
 from telegram import Update
 from telegram.ext import (
     Application,
@@ -18,10 +16,13 @@ from src.config import settings
 from src.db.users import (
     register_user, add_interest, remove_interest, get_interests,
     set_frequency, get_frequency, FREQ_DIARIO, FREQ_NOVIDADES, get_sent_ids,
+    check_and_increment_daily,
 )
 from src.bot.notifier import run_etl_and_notify
 
 _TZ = ZoneInfo("America/Bahia")
+MAX_HISTORY_TURNS = 5
+DAILY_QUESTION_LIMIT = 20
 
 
 # ── Comandos ──────────────────────────────────────────────────────────────────
@@ -52,7 +53,7 @@ async def cmd_interesse(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     termo = " ".join(context.args).strip() if context.args else ""
     if not termo:
         await update.message.reply_text(
-            "Informe o cargo ou área. Exemplo:\n/interesse analista de sistemas"
+            "Informe o cargo ou area. Exemplo:\n/interesse analista de sistemas"
         )
         return
 
@@ -132,28 +133,9 @@ async def cmd_frequencia(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         FREQ_DIARIO:    "voce recebera o digest toda manha as 07h.",
         FREQ_NOVIDADES: "voce so sera avisado quando sair uma publicacao nova.",
     }
-    await update.message.reply_text(f"Frequencia atualizada: *{opcao}*\nAgora {descricao[opcao]}", parse_mode=ParseMode.MARKDOWN)
-
-
-async def cmd_vagas(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    interests = get_interests(update.effective_user.id)
-    if not interests:
-        await update.message.reply_text(
-            "Você não tem interesses cadastrados. Use /interesse <termo> primeiro."
-        )
-        return
-
-    termos = ", ".join(interests)
     await update.message.reply_text(
-        f"Buscando publicações recentes para: {termos}..."
-    )
-
-    # Delega para o handler de mensagem reusando o chain
-    context.user_data["_vagas_query"] = (
-        f"Quais as publicações mais recentes do DOE-BA sobre {termos}?"
-    )
-    await update.message.reply_text(
-        f"Quais as publicações mais recentes do DOE-BA sobre {termos}?"
+        f"Frequencia atualizada: *{opcao}*\nAgora {descricao[opcao]}",
+        parse_mode=ParseMode.MARKDOWN,
     )
 
 
@@ -162,35 +144,67 @@ async def cmd_vagas(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 def _format_history(history: list[tuple[str, str]]) -> str:
     if not history:
         return ""
-    lines = ["\nHistórico da conversa:"]
+    lines = ["\nHistorico da conversa:"]
     for human, ai in history:
-        lines.append(f"Usuário: {human}")
+        lines.append(f"Usuario: {human}")
         lines.append(f"Assistente: {ai}")
     return "\n".join(lines) + "\n"
 
 
+async def _invoke_chain(
+    chain: Runnable,
+    question: str,
+    context: ContextTypes.DEFAULT_TYPE,
+    user_id: int,
+) -> str:
+    if not check_and_increment_daily(user_id, DAILY_QUESTION_LIMIT):
+        return (
+            f"Você atingiu o limite de {DAILY_QUESTION_LIMIT} perguntas por dia. "
+            "Volte amanhã!"
+        )
+
+    history: list[tuple[str, str]] = context.user_data.setdefault("history", [])
+    try:
+        answer = await chain.ainvoke({
+            "question": question,
+            "history": _format_history(history),
+        })
+    except Exception as e:
+        answer = f"Erro ao consultar a base. Tente novamente. ({e})"
+
+    history.append((question, answer))
+    if len(history) > MAX_HISTORY_TURNS:
+        history.pop(0)
+
+    return answer
+
+
 def make_message_handler(chain: Runnable):
     async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        question = update.message.text
-        await update.message.reply_text("Buscando no Diário Oficial...")
-
-        history: list[tuple[str, str]] = context.user_data.setdefault("history", [])
-
-        try:
-            answer = await chain.ainvoke({
-                "question": question,
-                "history": _format_history(history),
-            })
-        except Exception as e:
-            answer = f"Erro ao consultar a base. Tente novamente. ({e})"
-
-        history.append((question, answer))
-        if len(history) > MAX_HISTORY_TURNS:
-            history.pop(0)
-
+        await update.message.reply_text("Buscando no Diario Oficial...")
+        answer = await _invoke_chain(chain, update.message.text, context, update.effective_user.id)
         await update.message.reply_text(answer)
 
     return handle_message
+
+
+def make_vagas_handler(chain: Runnable):
+    async def cmd_vagas(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        interests = get_interests(update.effective_user.id)
+        if not interests:
+            await update.message.reply_text(
+                "Voce nao tem interesses cadastrados. Use /interesse <termo> primeiro."
+            )
+            return
+
+        termos = ", ".join(interests)
+        await update.message.reply_text(f"Buscando publicacoes recentes para: {termos}...")
+
+        question = f"Quais as publicacoes mais recentes do DOE-BA sobre {termos}?"
+        answer = await _invoke_chain(chain, question, context, update.effective_user.id)
+        await update.message.reply_text(answer)
+
+    return cmd_vagas
 
 
 # ── Job agendado (ETL + notificações) ────────────────────────────────────────
@@ -209,10 +223,9 @@ def create_app(chain: Runnable) -> Application:
     app.add_handler(CommandHandler("remover", cmd_remover))
     app.add_handler(CommandHandler("perfil", cmd_perfil))
     app.add_handler(CommandHandler("frequencia", cmd_frequencia))
-    app.add_handler(CommandHandler("vagas", cmd_vagas))
+    app.add_handler(CommandHandler("vagas", make_vagas_handler(chain)))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, make_message_handler(chain)))
 
-    # Agenda ETL + notificação às 07h e 19h (horário de Bahia)
     jq = app.job_queue
     jq.run_daily(_job_etl_notify, time=time(7, 0, tzinfo=_TZ),  name="etl_07h")
     jq.run_daily(_job_etl_notify, time=time(19, 0, tzinfo=_TZ), name="etl_19h")

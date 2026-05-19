@@ -8,18 +8,35 @@ urllib3.disable_warnings()
 
 BASE_URL = "https://dool.egba.ba.gov.br"
 KEYWORDS = {
+    # editais
     "concurso público", "concurso publico",
     "processo seletivo",
-    "edital de abertura", "edital de concurso", "edital de retificação",
-    "nomeação", "nomeacao",
-    "homologação", "homologacao",
-    "convocação para posse", "convocacao para posse",
-    "resultado final", "resultado definitivo",
-    "aprovados", "classificados",
-    "reda",
-    "pss",
+    "edital de abertura", "edital de concurso",
     "inscrições abertas", "inscricoes abertas",
-    "vagas",
+    "reda", "pss",
+    # movimentações de pessoal
+    "nomeação", "nomeacao",
+    "convocação", "convocacao",
+    "posse",
+    "apostila",
+    # resultados
+    "homologação", "homologacao",
+    "resultado",
+    "aprovados", "classificados",
+    # correções
+    "retificação", "retificacao",
+    "errata",
+}
+
+# Categorias do sumário que são sempre relevantes, independente do título
+RELEVANT_CATEGORIES = {
+    "convocação", "convocacao",
+    "homologação", "homologacao",
+    "resultado",
+    "resultados e homologações", "resultados e homologacoes",
+    "retificação/errata", "retificacao/errata",
+    "retificação", "retificacao",
+    "apostila",
 }
 
 _HEADERS = {
@@ -41,6 +58,10 @@ def _client() -> httpx.Client:
 def _matches_keywords(text: str) -> bool:
     t = text.lower()
     return any(kw in t for kw in KEYWORDS)
+
+
+def _relevant_category(cat: str) -> bool:
+    return cat.strip().lower() in RELEVANT_CATEGORIES
 
 
 def _get_edition_id(client: httpx.Client, target_date: date) -> str | None:
@@ -71,7 +92,6 @@ def _get_relevant_links(client: httpx.Client, edition_id: str) -> list[dict]:
     relevantes = []
     for link in links:
         texto = link.get_text(strip=True)
-        # categoria pai mais próxima
         cat = ""
         for parent in link.parents:
             if parent.name == "ul":
@@ -79,7 +99,7 @@ def _get_relevant_links(client: httpx.Client, edition_id: str) -> list[dict]:
                 if folder:
                     cat = folder.get_text(strip=True)
                     break
-        if _matches_keywords(texto) or _matches_keywords(cat):
+        if _matches_keywords(texto) or _matches_keywords(cat) or _relevant_category(cat):
             relevantes.append({
                 "materia_id": link.get("identificador"),
                 "titulo": texto,

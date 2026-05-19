@@ -50,6 +50,7 @@ e lembre ao usuário qual é o seu escopo.
 - Se a informação não estiver nos documentos, diga que não encontrou nada publicado sobre isso \
 no período indexado.
 - Ao mencionar datas, use a data atual como referência para expressões como "esta semana" ou "recente".
+- Sempre informe a data de publicação de cada documento ao citá-lo (ex: "publicado em 16 de maio de 2026").
 {history}
 Documentos relevantes do DOE-BA:
 {context}
@@ -59,11 +60,21 @@ Pergunta: {question}
 Resposta:"""
 
 
+def _fmt_date(iso: str) -> str:
+    try:
+        from datetime import date as _date
+        d = _date.fromisoformat(iso)
+        return f"{d.day} de {_MONTHS_PT[d.month - 1]} de {d.year}"
+    except Exception:
+        return iso
+
+
 def _format_docs(docs: list[Document]) -> str:
     parts = []
     for doc in docs:
         meta = doc.metadata
-        header = f"[{meta.get('date', '?')} | {meta.get('title', '')}]"
+        date_str = _fmt_date(meta.get("date", ""))
+        header = f"[Publicado em {date_str} | {meta.get('title', '')}]"
         parts.append(f"{header}\n{doc.page_content}")
     return "\n\n---\n\n".join(parts)
 
